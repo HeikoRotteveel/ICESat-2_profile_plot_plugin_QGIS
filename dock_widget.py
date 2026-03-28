@@ -1,5 +1,5 @@
 """
-ICESat-2 Profile Viewer — Dock Widget
+ICESat-2 Profile Viewer
 Plots selected features as a height cross-section, colored by confidence.
 Overlay fields are plotted as lines with individual twin y-axes.
 Water body regions are highlighted as a shaded band + diamond markers.
