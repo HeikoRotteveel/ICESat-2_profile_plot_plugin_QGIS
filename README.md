@@ -2,6 +2,8 @@
 
 For my master thesis I needed a QGIS plugin for visualizing ICESat-2 point data. This plugin can plot a selection of the data as an along-track elevation profile.It generates an interactive cross-section plot where the points are colored based on their confidence. There is also the possibility to add optional overlay variables, and section highlighting (in this case water body highlighting).
 
+![Plugin screenshot.png](figures%2FPlugin%20screenshot.png)
+
 ---
 ## Install from ZIP
 
@@ -32,6 +34,9 @@ This plugin does not automatically work on the HDF5 files provided by NASA. The 
 
 ---
 ## Output
+
+![result.png](figures%2Fresult.png)
+
 The plugin generates a profile plot with:
 
 * **X-axis**: Along-track distance (meters)
