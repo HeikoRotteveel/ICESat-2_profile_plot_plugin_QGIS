@@ -4,14 +4,25 @@ Plots selected features as a height cross-section, colored by confidence.
 Overlay fields are plotted as lines with individual twin y-axes.
 Water body regions are highlighted as a shaded band + diamond markers.
 
-Thanks to the great documentation provided by QGIS: https://docs.qgis.org/3.44/en/docs/pyqgis_developer_cookbook/plugins/index.html
+Fast path: geopandas (bundled with QGIS on Windows) reads the GeoParquet
+file directly, bypassing the slow QGIS feature iterator.
+Fallback: QGIS feature iterator when the layer is not a plain file on disk.
+
+Thanks to the great documentation provided by QGIS:
+https://docs.qgis.org/3.44/en/docs/pyqgis_developer_cookbook/plugins/index.html
 
 Author: H.B. Rotteveel
 Date: 28/03/2026
 """
 
-import math
+import os
 import numpy as np
+
+try:
+    import geopandas as gpd
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
 
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -20,7 +31,7 @@ from qgis.PyQt.QtWidgets import (
     QScrollArea, QToolButton
 )
 from qgis.PyQt.QtCore import Qt
-from qgis.core import QgsProject
+from qgis.core import QgsProject, QgsFeatureRequest
 
 import matplotlib
 matplotlib.use("Qt5Agg")
@@ -30,32 +41,32 @@ from matplotlib.figure import Figure
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 
-# Helper functions
-def haversine_meters(lat1, lon1, lat2, lon2):
-    R = 6_371_008.8
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
 
 
+# Vectorised geodesic distance
 def cumulative_distance(lats, lons):
-    dist = [0.0]
-    for i in range(1, len(lats)):
-        dist.append(dist[-1] + haversine_meters(lats[i - 1], lons[i - 1], lats[i], lons[i]))
-    return np.array(dist)
+    """Cumulative along-track distances in metres. Fully vectorised."""
+    R = 6_371_008.8
+    lat = np.radians(lats)
+    lon = np.radians(lons)
+    dlat = np.diff(lat)
+    dlon = np.diff(lon)
+    a = (np.sin(dlat / 2) ** 2
+         + np.cos(lat[:-1]) * np.cos(lat[1:]) * np.sin(dlon / 2) ** 2)
+    d = 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+    return np.concatenate(([0.0], np.cumsum(d)))
 
-# Color map used based on ICESat-2 variables
+
+# Colour maps
+
 CONF_COLORS = {
-    -1: "#9e9e9e",   # grey       — invalid
-     0: "#e0e0e0",   # light grey — noise
-     1: "#ffeb3b",   # yellow     — low
-     2: "#ff9800",   # orange     — medium
-     3: "#4caf50",   # green      — high
-     4: "#00bcd4",   # cyan       — very high
+    -1: "#9e9e9e",
+     0: "#e0e0e0",
+     1: "#ffeb3b",
+     2: "#ff9800",
+     3: "#4caf50",
+     4: "#00bcd4",
 }
-
 CONF_LABELS = {
     -1: "-1  invalid",
      0:  "0  noise",
@@ -64,14 +75,14 @@ CONF_LABELS = {
      3:  "3  high",
      4:  "4  very high",
 }
-
-# Cycling palette for overlay lines
 OVERLAY_PALETTE = [
     "#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff",
     "#f08cff", "#ff9f43", "#48dbfb", "#ff9ff3",
 ]
 
-# Used to identify different possible names that people might use for their fields
+
+
+# Field auto-detection
 def _find_field(fields, candidates):
     names = {f.name().lower(): f.name() for f in fields}
     for c in candidates:
@@ -88,12 +99,119 @@ HEIGHT_CANDIDATES = [
     "height", "h", "z", "elevation", "elev", "h_ph",
     "h_te_best_fit", "h_li", "h_mean", "h_canopy"
 ]
-LAT_CANDIDATES  = ["lat", "latitude", "y", "lat_ph"]
-LON_CANDIDATES  = ["lon", "longitude", "x", "lon_ph"]
+LAT_CANDIDATES   = ["lat", "latitude", "y", "lat_ph"]
+LON_CANDIDATES   = ["lon", "longitude", "x", "lon_ph"]
 WATER_CANDIDATES = [
     "water", "water_body", "is_water", "inland_water",
     "water_flag", "segment_watermask", "lake_flag"
 ]
+
+
+
+# Data loading — geopandas fast path + QGIS iterator fallback
+def _parquet_path(layer):
+    """Return file path if layer is a plain GeoParquet file, else None."""
+    if not GEOPANDAS_AVAILABLE:
+        return None
+    src = layer.source().split("|")[0].strip()
+    if src.lower().endswith((".parquet", ".geoparquet")) and os.path.isfile(src):
+        return src
+    return None
+
+
+def _detect_fid_offset(layer):
+    """Return the FID of the first feature (0 or 1) to map FIDs → row indices."""
+    req = QgsFeatureRequest()
+    req.setLimit(1)
+    req.setFlags(QgsFeatureRequest.NoGeometry)
+    req.setSubsetOfAttributes([])
+    for feat in layer.getFeatures(req):
+        return feat.id()
+    return 0
+
+
+def load_arrays(layer, columns, selected_fids=None):
+    """
+    Load `columns` from `layer` into a dict of {col: np.ndarray}.
+
+    Uses geopandas to read the Parquet file directly when possible —
+    this is substantially faster than the QGIS feature iterator because
+    geopandas reads columnar data in bulk without unpacking geometry.
+
+    Falls back to the QGIS iterator for non-file layers.
+
+    Returns (data_dict, error_string_or_None).
+    """
+    path = _parquet_path(layer)
+
+    if path is not None:
+        return _geopandas_load(path, layer, columns, selected_fids)
+    else:
+        return _qgis_fallback(layer, columns, selected_fids)
+
+
+def _geopandas_load(path, layer, columns, selected_fids):
+    """Read via geopandas — fast columnar path."""
+    try:
+        # Read only the columns we need (geopandas passes this to the
+        # underlying engine, so unneeded columns are never decompressed)
+        # geometry column is always read by geopandas but we just ignore it
+        gdf = gpd.read_file(path, columns=columns, engine="pyogr")
+    except Exception:
+        # engine="pyogr" may not be available in all QGIS builds;
+        # fall back to the default engine
+        try:
+            gdf = gpd.read_file(path, columns=columns)
+        except Exception as e:
+            return _qgis_fallback(layer, columns, selected_fids)
+
+    # Filter to selected rows if needed
+    if selected_fids:
+        fid_offset  = _detect_fid_offset(layer)
+        # QGIS FIDs map directly to DataFrame row positions
+        row_indices = np.asarray(sorted(selected_fids), dtype=np.int64) - fid_offset
+        n = len(gdf)
+        row_indices = row_indices[(row_indices >= 0) & (row_indices < n)]
+        if len(row_indices) == 0:
+            return None, "Selection produced no valid row indices."
+        gdf = gdf.iloc[row_indices]
+
+    # Check all requested columns exist
+    missing = [c for c in columns if c not in gdf.columns]
+    if missing:
+        return None, f"Columns not found: {missing}"
+
+    result = {}
+    for c in columns:
+        try:
+            result[c] = gdf[c].to_numpy(dtype=np.float64, na_value=np.nan)
+        except (ValueError, TypeError):
+            result[c] = gdf[c].to_numpy()
+    return result, None
+
+
+def _qgis_fallback(layer, columns, selected_fids):
+    """Slow path: QGIS feature iterator. Used when geopandas is unavailable."""
+    fields = layer.fields()
+
+    req = QgsFeatureRequest()
+    req.setFlags(QgsFeatureRequest.NoGeometry)
+    req.setSubsetOfAttributes(columns, fields)
+    if selected_fids:
+        req.setFilterFids(list(selected_fids))
+
+    data = {c: [] for c in columns}
+    for feat in layer.getFeatures(req):
+        for c in columns:
+            try:
+                data[c].append(float(feat[c]))
+            except (TypeError, ValueError):
+                data[c].append(np.nan)
+
+    if not data or not any(data.values()):
+        return None, "No data returned."
+
+    return {c: np.array(v, dtype=np.float64) for c, v in data.items()}, None
 
 
 
@@ -132,7 +250,7 @@ class OverlayFieldRow(QWidget):
 
 
 
-# Main dock
+# Main dock widget
 class ProfileDockWidget(QDockWidget):
     def __init__(self, iface):
         super().__init__("ICESat-2 Profile Viewer")
@@ -141,7 +259,6 @@ class ProfileDockWidget(QDockWidget):
         self.setObjectName("ICESat2ProfileDock")
         self._overlay_rows = []
 
-        # Outer scroll so controls stay accessible when the dock is narrow
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -152,6 +269,19 @@ class ProfileDockWidget(QDockWidget):
         outer = QVBoxLayout(main)
         outer.setSpacing(6)
         outer.setContentsMargins(8, 8, 8, 8)
+
+        # Warning banner if geopandas missing
+        if not GEOPANDAS_AVAILABLE:
+            warn = QLabel(
+                "⚠  geopandas not found — using slower QGIS iterator.\n"
+                "Install via OSGeo4W Shell:  pip install geopandas"
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                "color: #b8860b; background: #2a2000; border: 1px solid #665500;"
+                "padding: 5px; border-radius: 3px; font-size: 8pt;"
+            )
+            outer.addWidget(warn)
 
         # Data source
         src_box = QGroupBox("Data source")
@@ -264,7 +394,7 @@ class ProfileDockWidget(QDockWidget):
         QgsProject.instance().layersAdded.connect(self._populate_layers)
         QgsProject.instance().layersRemoved.connect(self._populate_layers)
 
-    # Layer helpers
+    #  Layer helpers
     def _populate_layers(self):
         prev = self.layer_combo.currentData()
         self.layer_combo.blockSignals(True)
@@ -301,7 +431,6 @@ class ProfileDockWidget(QDockWidget):
         populate(self.conf_combo,  CONFIDENCE_CANDIDATES)
         populate(self.water_combo, WATER_CANDIDATES)
 
-        # Refresh existing overlay rows' field lists
         field_names = [f.name() for f in fields]
         for row in self._overlay_rows:
             cur = row.field_name()
@@ -359,67 +488,66 @@ class ProfileDockWidget(QDockWidget):
             if r.is_enabled() and r.field_name()
         ]
 
-        # Gather features
+        # Deduplicated column list
+        columns = list(dict.fromkeys(
+            [lat_f, lon_f, h_f]
+            + ([conf_f]  if conf_f  else [])
+            + ([water_f] if water_f else [])
+            + overlay_fields
+        ))
+
+        selected_fids = None
         if self.sel_only_cb.isChecked():
-            features = list(layer.selectedFeatures())
-            if not features:
+            fids = layer.selectedFeatureIds()
+            if not fids:
                 self._status("⚠ No features selected.", error=True)
                 return
-        else:
-            features = list(layer.getFeatures())
+            selected_fids = fids
 
-        if not features:
-            self._status("⚠ No features found.", error=True)
+        self._status("⏳ Loading…")
+        self.plot_btn.setEnabled(False)
+        self.canvas.repaint()
+
+        data, err = load_arrays(layer, columns, selected_fids)
+        self.plot_btn.setEnabled(True)
+
+        if data is None:
+            self._status(f"⚠ {err}", error=True)
             return
 
-        # Extract attributes
-        lats, lons, heights, confs, waters = [], [], [], [], []
-        overlay_vals = {f: [] for f in overlay_fields}
-
-        for feat in features:
+        # Coerce arrays
+        def to_float(arr):
             try:
-                lat = float(feat[lat_f])
-                lon = float(feat[lon_f])
-                h   = float(feat[h_f])
-            except (TypeError, ValueError):
-                continue
+                return arr.astype(np.float64)
+            except (ValueError, TypeError):
+                return np.full(len(arr), np.nan)
 
-            lats.append(lat); lons.append(lon); heights.append(h)
-            confs.append(int(feat[conf_f]) if conf_f else 0)
+        lats    = to_float(data[lat_f])
+        lons    = to_float(data[lon_f])
+        heights = to_float(data[h_f])
+        confs   = data[conf_f].astype(np.int8) if conf_f  else np.zeros(len(lats), np.int8)
+        waters  = data[water_f].astype(bool)   if water_f else np.zeros(len(lats), bool)
 
-            if water_f:
-                try:
-                    w = feat[water_f]
-                    waters.append(bool(int(w)) if w is not None else False)
-                except (TypeError, ValueError):
-                    waters.append(False)
-            else:
-                waters.append(False)
+        # Drop rows where core fields are NaN
+        valid   = np.isfinite(lats) & np.isfinite(lons) & np.isfinite(heights)
+        lats    = lats[valid];    lons    = lons[valid]
+        heights = heights[valid]; confs   = confs[valid]; waters = waters[valid]
+        ov_data = {of: to_float(data[of])[valid] for of in overlay_fields}
 
-            for of in overlay_fields:
-                try:
-                    overlay_vals[of].append(float(feat[of]))
-                except (TypeError, ValueError):
-                    overlay_vals[of].append(float("nan"))
-
-        if not lats:
-            self._status("⚠ Could not extract any valid points.", error=True)
+        if len(lats) == 0:
+            self._status("⚠ No valid points after filtering.", error=True)
             return
 
         # Sort along-track by latitude
         order   = np.argsort(lats)
-        lats    = [lats[i]  for i in order]
-        lons    = [lons[i]  for i in order]
-        heights = np.array([heights[i] for i in order])
-        confs   = np.array([confs[i]   for i in order])
-        waters  = np.array([waters[i]  for i in order], dtype=bool)
-        for of in overlay_fields:
-            overlay_vals[of] = np.array([overlay_vals[of][i] for i in order])
+        lats    = lats[order];    lons    = lons[order]
+        heights = heights[order]; confs   = confs[order]; waters = waters[order]
+        ov_data = {of: v[order] for of, v in ov_data.items()}
 
         dist_m = cumulative_distance(lats, lons)
         n_ov   = len(overlay_fields)
 
-        # Figure margins — widen right side for each twin axis
+        # Figure layout
         right = max(0.78 - (n_ov - 1) * 0.09, 0.50) if n_ov > 0 else 0.93
         self.figure.clear()
         self.figure.subplots_adjust(left=0.09, right=right, top=0.91, bottom=0.10)
@@ -428,20 +556,13 @@ class ProfileDockWidget(QDockWidget):
 
         pt_size = self.pt_size_spin.value()
 
-        # Water region shading (background)
+        # Water region shading
         if self.show_water_cb.isChecked() and water_f and waters.any():
-            in_water  = False
-            seg_start = 0.0
-            for i, w in enumerate(waters):
-                if w and not in_water:
-                    seg_start = dist_m[i]
-                    in_water  = True
-                elif not w and in_water:
-                    ax.axvspan(seg_start, dist_m[i - 1],
-                               color="#1a6fa8", alpha=0.18, zorder=1, linewidth=0)
-                    in_water = False
-            if in_water:
-                ax.axvspan(seg_start, dist_m[-1],
+            padded = np.concatenate([[False], waters, [False]])
+            starts = np.where(np.diff(padded.astype(np.int8)) ==  1)[0]
+            ends   = np.where(np.diff(padded.astype(np.int8)) == -1)[0] - 1
+            for s, e in zip(starts, ends):
+                ax.axvspan(dist_m[s], dist_m[e],
                            color="#1a6fa8", alpha=0.18, zorder=1, linewidth=0)
 
         # Elevation scatter coloured by confidence
@@ -460,7 +581,7 @@ class ProfileDockWidget(QDockWidget):
             legend_handles.append(sc)
             legend_labels.append(label)
 
-        # Water point markers (diamond outline)
+        # Water point markers
         if self.show_water_cb.isChecked() and water_f and waters.any():
             ax.scatter(
                 dist_m[waters], heights[waters],
@@ -484,22 +605,20 @@ class ProfileDockWidget(QDockWidget):
             fontsize=10, fontweight="bold", color="#ffffff", pad=8
         )
 
-        # Overlay lines — each on its own twin y-axis
+        # Overlay lines
         for idx_ov, of in enumerate(overlay_fields):
             color = OVERLAY_PALETTE[idx_ov % len(OVERLAY_PALETTE)]
-            vals  = overlay_vals[of]
-            valid = ~np.isnan(vals)
+            vals  = ov_data[of]
+            valid_ov = ~np.isnan(vals)
 
             tax = ax.twinx()
             self._style_twin_ax(tax, color)
 
-            # Shift successive axes further right
             if idx_ov > 0:
-                offset = 1.0 + idx_ov * 0.10
-                tax.spines["right"].set_position(("axes", offset))
+                tax.spines["right"].set_position(("axes", 1.0 + idx_ov * 0.10))
                 tax.spines["right"].set_visible(True)
 
-            tax.plot(dist_m[valid], vals[valid],
+            tax.plot(dist_m[valid_ov], vals[valid_ov],
                      color=color, linewidth=1.4, alpha=0.85, zorder=6)
             tax.set_ylabel(of, fontsize=8, color=color, labelpad=4)
             tax.tick_params(axis="y", colors=color, labelsize=8)
@@ -511,10 +630,7 @@ class ProfileDockWidget(QDockWidget):
         # Legend
         if self.show_legend_cb.isChecked() and legend_handles:
             if self.show_water_cb.isChecked() and water_f and waters.any():
-                rh = mpatches.Patch(
-                    facecolor="#1a6fa8", alpha=0.40,
-                    edgecolor="none"
-                )
+                rh = mpatches.Patch(facecolor="#1a6fa8", alpha=0.40, edgecolor="none")
                 legend_handles.append(rh)
                 legend_labels.append("water region")
 
