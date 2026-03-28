@@ -50,3 +50,9 @@ The plugin generates a profile plot with:
 | Blue shading        | Water regions                    |
 | Lines               | Overlay variables                |
 | Legend              | Optional, fully combined         |
+
+---
+## Other
+* The logo of the QGIS plugin is a pixelized version of the original ICESat-2 logo (see figures)
+* The [QGIS Plugin Development Documentation](https://docs.qgis.org/3.44/en/docs/pyqgis_developer_cookbook/plugins/index.html) was of great help!
+* © 2026. This work is openly licensed via CC BY 4.0.
