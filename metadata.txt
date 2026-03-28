@@ -1,0 +1,16 @@
+[general]
+name=ICESat-2 Profile Viewer
+qgisMinimumVersion=3.16
+description=Cross-section profile viewer for ICESat-2 GeoParquet beams. Plots selected points as height vs. along-track distance, colored by confidence.
+version=1.0.0
+author=H.B. Rotteveel
+email=H.B.Rotteveel@student.tudelft.nl
+about=Select a subset of ICESat-2 points in QGIS, then open this panel to view their elevation profile. Points are colored by confidence (-1 to 4) and water body intersections are shown with a different marker.
+tracker=TBD
+repository=TBD
+tags=icesat2,lidar,elevation,profile,cross-section,geoparquet
+homepage=TBD
+category=Plugins
+icon=icon.png
+experimental=False
+deprecated=False
